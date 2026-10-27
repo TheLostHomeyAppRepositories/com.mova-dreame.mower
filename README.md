@@ -205,9 +205,10 @@ Open the Homey app, add a new device and select MOVA or Dreame as brand and your
 
 **When...**
 - Mowing started
-- Mowing completed
-- Mower docked at station
-- Mower returning to dock
+- Mowing completed *(not fired when the run was interrupted, see below)*
+- Mowing interrupted *(tokens: interruption type, interruption reason, interruption code)*
+- Mower docked at station *(tokens: interruption type, reason, code)*
+- Mower returning to dock *(tokens: interruption type, reason, code)*
 - Mower status changed *(token: status)*
 - Charging status changed *(token: status)*
 - Mower error occurred *(tokens: error code, error description)*
@@ -221,6 +222,8 @@ Open the Homey app, add a new device and select MOVA or Dreame as brand and your
 - Stop button pressed
 - Return to Dock button pressed
 - Go to Maintenance Point button pressed
+
+The **interruption type** token is one of `rain`, `frost`, `do_not_disturb`, `low_battery` — or `none` when the run was not interrupted. Use it to tell a finished run apart from one stopped by the weather, e.g. *When mower docked at station → And interruption type is rain → Then …*. It is derived from the mower's own info codes (54–62); if the mower reports the reason only after it has docked, the dock card still carries `none` and the reason arrives via *Mowing interrupted*.
 
 **And...**
 - Mower is / is not mowing

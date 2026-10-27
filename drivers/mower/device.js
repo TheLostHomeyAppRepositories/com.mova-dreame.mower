@@ -65,6 +65,21 @@ const ERROR_DEVICE_CODES = new Set([
 ]);
 const WARNING_DEVICE_CODES = new Set([31,32,33,34,35,36,38,39,40,41,42,43,44,45]);
 
+// Info codes that explain why a mowing task stopped or returned early. They are
+// not errors, but Flows need them to tell "finished" apart from "interrupted".
+// Texts live in locales error_codes.<code>; the type is a stable Flow value.
+const INTERRUPTION_CODES = new Map([
+  [54, 'low_battery'],     // Low battery — returning to dock
+  [55, 'low_battery'],     // Scheduled task suspended — low battery
+  [56, 'rain'],            // Mowing paused — bad weather
+  [57, 'rain'],            // Scheduled task interrupted — rain
+  [58, 'rain'],            // Scheduled task suspended — rain
+  [59, 'frost'],           // Returning to dock — freezing conditions
+  [60, 'frost'],           // Suspended — freezing conditions
+  [61, 'do_not_disturb'],  // Returning — do not disturb active
+  [62, 'do_not_disturb'],  // Suspended — do not disturb mode
+]);
+
 const HOME_STATUSES = new Set(['idle', 'standby', 'docked', 'charging']);
 const ACTIVE_WORK_STATUSES = new Set(['mowing', 'mapping', 'returning', 'remote_control']);
 
@@ -670,6 +685,10 @@ class MowerDevice extends Homey.Device {
     this._trgMowingCompleted  = this.homey.flow.getDeviceTriggerCard('mowing_completed');
     this._trgMowingStarted    = this.homey.flow.getDeviceTriggerCard('mowing_started');
     this._trgError            = this.homey.flow.getDeviceTriggerCard('mower_error');
+    this._trgInterrupted      = this.homey.flow.getDeviceTriggerCard('mowing_interrupted');
+    this._interruption            = null;  // { code, type, reason, at } of the current/last run
+    this._lastInfoCode            = 0;     // last telemetry fault/info code (change detection)
+    this._pendingInterruptionCode = null;  // code seen while still mowing, awaiting status
     this._trgDocked           = this.homey.flow.getDeviceTriggerCard('mower_docked');
     this._trgFirmwareUpdate   = this.homey.flow.getDeviceTriggerCard('firmware_update_available');
     this._trgBatteryLow       = this.homey.flow.getDeviceTriggerCard('battery_low');
@@ -1594,6 +1613,9 @@ class MowerDevice extends Homey.Device {
       if (mowerStatus === 'error' || rawStatus === 'paused') {
         this.log(`[diag] latestStatus=${info.latestStatus} rawStatus=${rawStatus} effective=${mowerStatus} faultCode=${faultCode} mqttErrorCode=${this._mqttErrorCode ?? 'none'}`);
       }
+      // Before _applyStatus, so the returning/docked triggers it fires already
+      // carry the interruption reason as tokens.
+      this._trackInterruption(mowerStatus, effectiveFaultCode);
       await this._applyStatus(mowerStatus, effectiveFaultCode);
       await this._observeNativeMaintenanceArrival(this._latestNativeStatusCode, mowerStatus, effectiveFaultCode).catch((e) => this.error('[maintenance] native arrival observer:', e.message));
 
@@ -3099,6 +3121,43 @@ class MowerDevice extends Homey.Device {
     await this._updateCommandButtonUi(this._nativeMowerStatus || this.getCapabilityValue('mower_status')).catch(() => {});
   }
 
+  /** Flow tokens describing why the current/last mowing run stopped early. */
+  _interruptionTokens() {
+    const i = this._interruption;
+    if (!i) return { reason_type: 'none', reason: '', reason_code: 0 };
+    return { reason_type: i.type, reason: i.reason, reason_code: i.code };
+  }
+
+  /**
+   * Detect rain/frost/do-not-disturb/low-battery interruptions from telemetry.
+   *
+   * Only the poll path feeds this: command handlers call _applyStatus() with a
+   * placeholder fault code of 0, which would otherwise look like the code
+   * clearing and re-firing the trigger on the next poll.
+   *
+   * A code counts only when it *changes* to an interruption code. Some firmware
+   * keeps reporting the last info code long after the event, and a stale
+   * "rain" must not label the next regular finish as rain. While the mower is
+   * still actively mowing the change is held back until the status follows,
+   * because the info code can arrive one poll before the status does.
+   */
+  _trackInterruption(status, faultCode) {
+    const code = Number(faultCode) || 0;
+    if (code !== this._lastInfoCode) {
+      this._lastInfoCode = code;
+      this._pendingInterruptionCode = INTERRUPTION_CODES.has(code) ? code : null;
+    }
+    const pending = this._pendingInterruptionCode;
+    if (pending == null || status === 'mowing') return;
+    this._pendingInterruptionCode = null;
+
+    const reason = this.homey.__(`error_codes.${pending}`) || `Code ${pending}`;
+    this._interruption = { code: pending, type: INTERRUPTION_CODES.get(pending), reason, at: Date.now() };
+    this.log(`[interruption] ${this._interruption.type} (code ${pending}): ${reason}`);
+    this._trgInterrupted.trigger(this, this._interruptionTokens(), {})
+      .catch((e) => this.error('mowing_interrupted trigger:', e.message));
+  }
+
   async _applyStatus(status, faultCode = 0) {
     const validMowerStatuses = new Set(['idle', 'mowing', 'standby', 'paused', 'error', 'returning', 'charging', 'mapping', 'docked', 'updating', 'remote_control', 'garage']);
     if (!validMowerStatuses.has(status)) {
@@ -3191,6 +3250,9 @@ class MowerDevice extends Homey.Device {
 
     // Session duration tracking
     if (isMowing && !this._wasMowing) {
+      // A new or resumed run starts without a reason; the previous stop's reason
+      // must not leak into this run's return/dock tokens.
+      this._interruption = null;
       // RC82: keep the last accepted native position until a fresh consistent
       // update arrives. Clearing it here caused the marker to jump to the dock or
       // to a lower-priority fallback at every new mowing session.
@@ -3248,13 +3310,13 @@ class MowerDevice extends Homey.Device {
 
     // Returning trigger
     if (status === 'returning') {
-      this._trgReturning.trigger(this, {}, {})
+      this._trgReturning.trigger(this, this._interruptionTokens(), {})
         .catch((e) => this.error('mower_returning trigger:', e.message));
     }
 
     // Docked trigger
     if (status === 'docked' || status === 'charging' || status === 'charging_completed') {
-      this._trgDocked.trigger(this, {}, {})
+      this._trgDocked.trigger(this, this._interruptionTokens(), {})
         .catch((e) => this.error('mower_docked trigger:', e.message));
     }
 
@@ -3289,7 +3351,11 @@ class MowerDevice extends Homey.Device {
       const returnPct   = snap.returnPct  ?? (this.getSetting('bat_return_pct')  ?? 15);
       const autoResume  = snap.autoResume ?? (this.getSetting('bat_auto_resume') ?? false);
       const isChargeBreak = autoResume && battery <= (returnPct + 2);
-      if (!isChargeBreak) {
+      if (this._interruption) {
+        // Rain, frost, do-not-disturb or low battery ended this run early; it is
+        // reported via "Mowing interrupted" and must not also read as "completed".
+        this.log(`[trigger] mowing_completed suppressed — interrupted (${this._interruption.type}, code ${this._interruption.code})`);
+      } else if (!isChargeBreak) {
         this._trgMowingCompleted.trigger(this, {}, {})
           .catch((e) => this.error('mowing_completed trigger:', e.message));
       } else {
